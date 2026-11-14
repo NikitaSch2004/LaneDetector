@@ -1,10 +1,16 @@
+
+
+
+https://github.com/user-attachments/assets/b4244360-0f6b-40fd-9643-c872dc90a973
+
+
 # Real-Time Lane Detection Pipeline in Pure C (OpenMP + SIMD)
 
 A high-performance, dependency-light computer vision pipeline written from scratch in C for real-time road lane detection. Built without OpenCV, the project implements a custom Canny edge detector, Region-of-Interest (ROI) masking, Hough Transform with inter-frame temporal smoothing, and zero-disk-I/O video streaming via FFmpeg pipes.
 
 ## Demo
 
-<!-- DRAG AND DROP assets/demo_output.mp4 HERE IN GITHUB WEB EDITOR -->
+https://github.com/user-attachments/assets/b4244360-0f6b-40fd-9643-c872dc90a973
 
 *Detected lane boundaries with Exponential Moving Average (EMA) smoothing, dynamic vanishing-point cutoff, and lane-carpet rendering.*
 
