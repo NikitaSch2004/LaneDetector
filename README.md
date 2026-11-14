@@ -49,7 +49,7 @@ Tested on a **41.1-second, 1280×720 @ 30 FPS video (1,232 frames)** on Apple Si
 ## Prerequisites & Usage
 
 ### Requirements
-* **macOS / Linux** with `clang` (or `gcc`)
+* **macOS / Linux / Windows** with `clang` (or `gcc`)
 * **OpenMP** (`brew install libomp` on macOS)
 * **FFmpeg** (`brew install ffmpeg` on macOS)
 
