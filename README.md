@@ -30,17 +30,24 @@ The straight-line model handles highway footage well. On the tight curves of `ha
 ## Pipeline
 
 ```mermaid
-flowchart LR
-    IN[input.mp4] -->|FFmpeg decode<br/>raw rgb24 pipe| G[Grayscale<br/>+ yellow boost]
-    G --> B[Gaussian blur<br/>separable 5x1]
-    B --> S[Sobel<br/>magnitude + direction]
-    S --> N[Non-maximum<br/>suppression]
-    N --> H[Hysteresis]
-    H --> R[ROI mask]
-    R --> T[Hough<br/>transform]
-    T --> E[EMA<br/>smoothing]
-    E --> D[Lane carpet<br/>rendering]
-    D -->|raw rgb24 pipe<br/>FFmpeg encode| OUT[output.mp4]
+flowchart TB
+    subgraph DECODE["main.c: input"]
+        direction LR
+        IN[input.mp4] --> DEC[FFmpeg decode<br/>raw rgb24 pipe]
+    end
+    subgraph CANNY["canny.c: Canny edge detector"]
+        direction LR
+        G[Grayscale<br/>+ yellow boost] --> B[Gaussian blur<br/>separable 5x1] --> S[Sobel<br/>magnitude + direction] --> N[Non-maximum<br/>suppression] --> H[Hysteresis]
+    end
+    subgraph LANES["lane_assist.c: lane finding"]
+        direction LR
+        R[ROI mask] --> T[Hough<br/>transform] --> E[EMA<br/>smoothing] --> D[Lane carpet<br/>rendering]
+    end
+    subgraph ENCODE["main.c: output"]
+        direction LR
+        ENC[raw rgb24 pipe<br/>FFmpeg encode] --> OUT[output.mp4]
+    end
+    DECODE --> CANNY --> LANES --> ENCODE
 ```
 
 1. **Zero-disk video streaming (`main.c`)**: raw `rgb24` frames are read from FFmpeg's `stdout` and written back to a second FFmpeg process for H.264 encoding. Resolution and frame rate are read with `ffprobe`; frames are scaled to 1280 px wide, keeping the aspect ratio.
