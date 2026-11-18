@@ -12,6 +12,7 @@ void rgbToGrayscale(const uint8_t *img, uint8_t *output, const int width, const 
 {
     if (!img || !output) return;
 
+    /*SLOWER WAY, COLLAPSE(2) WITHOUT RESTRICT POINTERS STOPS THE COMPILER FROM VECTORIZING THE LOOP
     #pragma omp parallel for collapse(2)
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
@@ -31,6 +32,26 @@ void rgbToGrayscale(const uint8_t *img, uint8_t *output, const int width, const 
             output[gray_idx] = gray;
         }
     }
+    */
+
+    //FASTER WAY, ONE ROW PER THREAD WITH RESTRICT POINTERS SO THE INNER LOOP IS VECTORIZED (SIMD)
+    #pragma omp parallel for
+    for (int y = 0; y < height; y++) {
+        const uint8_t *restrict src = img + (size_t)y * (size_t)width * (size_t)channels;
+        uint8_t *restrict dst = output + (size_t)y * (size_t)width;
+
+        #pragma omp simd
+        for (int x = 0; x < width; x++) {
+            int r = src[x * channels];
+            int g = src[x * channels + 1];
+            int b = src[x * channels + 2];
+
+            int gray = (306 * r + 601 * g + 117 * b) >> 10;
+            int yellow = r > 140 && g > 120 && b < 100 && (r - b) > 50;
+
+            dst[x] = (uint8_t)(yellow ? 255 : gray);
+        }
+    }
 }
 
 void cannyEdge(const uint8_t *img, uint8_t *output, int width, int height)
@@ -44,10 +65,10 @@ void cannyEdge(const uint8_t *img, uint8_t *output, int width, int height)
     static float   *nms           = NULL;
 
     if (!gaussian_blur) {
-        gaussian_blur = malloc(total_pixels * sizeof(*gaussian_blur));
-        magnitude_arr = malloc(total_pixels * sizeof(*magnitude_arr));
-        angles        = malloc(total_pixels * sizeof(*angles));
-        nms           = malloc(total_pixels * sizeof(*nms));
+        gaussian_blur = calloc(total_pixels, sizeof(*gaussian_blur));
+        magnitude_arr = calloc(total_pixels, sizeof(*magnitude_arr));
+        angles        = calloc(total_pixels, sizeof(*angles));
+        nms           = calloc(total_pixels, sizeof(*nms));
 
         if (!gaussian_blur || !magnitude_arr || !angles || !nms) {
             printf("Memory allocation failed in cannyEdge!\n");
@@ -59,10 +80,12 @@ void cannyEdge(const uint8_t *img, uint8_t *output, int width, int height)
         }
     }
 
+    /*SLOWER WAY, CLEARING EVERY BUFFER ON EVERY FRAME EVEN THOUGH EACH STAGE OVERWRITES IT
     memset(gaussian_blur, 0, total_pixels * sizeof(*gaussian_blur));
     memset(magnitude_arr, 0, total_pixels * sizeof(*magnitude_arr));
     memset(angles,        0, total_pixels * sizeof(*angles));
     memset(nms,           0, total_pixels * sizeof(*nms));
+    */
 
     gaussian_blur_conv(img, gaussian_blur, width, height);
     float max_mag = magnitude_and_angle(gaussian_blur, magnitude_arr, angles, width, height);
@@ -101,19 +124,20 @@ void gaussian_blur_conv(const uint8_t *img, uint8_t *output, const int width, co
         }
     }
     */
-    //FASTER WAY OF APPLYING GAUSSIAN KERNEL BY SEPARATING 2 5X1 MATRICES FOR X AND Y
+
+    /*SLOWER WAY OF APPLYING THE SEPARATED 5X1 KERNELS, COLLAPSE(2) STOPS VECTORIZATION AND THE ZERO BORDER CREATES FAKE EDGES
     if (!img || !output) return;
     size_t total_pixels = (size_t)width * (size_t)height;
     static uint8_t *temp = NULL;
     if (!temp) {
-        temp = malloc(total_pixels * sizeof(*temp));
+        temp = calloc(total_pixels, sizeof(*temp));
         if (!temp) return;
     }
 
     #pragma omp parallel for collapse(2)
     for (int y = 0; y < height; y++)
     {
-        for (int x = 2; x < width - 3; x++)
+        for (int x = 2; x < width - 2; x++)
         {
             int row = y * width;
             int sum = img[row + (x - 2)] * 1
@@ -126,7 +150,7 @@ void gaussian_blur_conv(const uint8_t *img, uint8_t *output, const int width, co
     }
 
     #pragma omp parallel for collapse(2)
-    for (int y = 2; y < height - 3; y++)
+    for (int y = 2; y < height - 2; y++)
     {
         for (int x = 2; x < width - 2; x++)
         {
@@ -138,7 +162,73 @@ void gaussian_blur_conv(const uint8_t *img, uint8_t *output, const int width, co
             output[y * width + x] = (uint8_t)(sum >> 4);
         }
     }
-    memset(temp, 0, total_pixels * sizeof(*temp));
+    */
+
+    //FASTER WAY, ONE ROW PER THREAD WITH RESTRICT POINTERS SO BOTH PASSES ARE VECTORIZED (SIMD), BORDER PIXELS ARE REPLICATED
+    if (!img || !output || width < 4 || height < 4) return;
+    size_t total_pixels = (size_t)width * (size_t)height;
+    static uint8_t *temp = NULL;
+    if (!temp) {
+        temp = malloc(total_pixels * sizeof(*temp));
+        if (!temp) return;
+    }
+
+    #pragma omp parallel for
+    for (int y = 0; y < height; y++)
+    {
+        const uint8_t *restrict src = img + (size_t)y * (size_t)width;
+        uint8_t *restrict dst = temp + (size_t)y * (size_t)width;
+
+        #pragma omp simd
+        for (int x = 2; x < width - 2; x++)
+        {
+            int sum = src[x - 2] * 1
+                    + src[x - 1] * 4
+                    + src[x    ] * 6
+                    + src[x + 1] * 4
+                    + src[x + 2] * 1;
+            dst[x] = (uint8_t)(sum >> 4);
+        }
+
+        const int border_x[4] = { 0, 1, width - 2, width - 1 };
+        for (int i = 0; i < 4; i++)
+        {
+            int x = border_x[i];
+            int xm2 = x - 2 < 0 ? 0 : x - 2;
+            int xm1 = x - 1 < 0 ? 0 : x - 1;
+            int xp1 = x + 1 >= width ? width - 1 : x + 1;
+            int xp2 = x + 2 >= width ? width - 1 : x + 2;
+            int sum = src[xm2] + 4 * src[xm1] + 6 * src[x] + 4 * src[xp1] + src[xp2];
+            dst[x] = (uint8_t)(sum >> 4);
+        }
+    }
+
+    #pragma omp parallel for
+    for (int y = 0; y < height; y++)
+    {
+        int ym2 = y - 2 < 0 ? 0 : y - 2;
+        int ym1 = y - 1 < 0 ? 0 : y - 1;
+        int yp1 = y + 1 >= height ? height - 1 : y + 1;
+        int yp2 = y + 2 >= height ? height - 1 : y + 2;
+
+        const uint8_t *restrict r0 = temp + (size_t)ym2 * (size_t)width;
+        const uint8_t *restrict r1 = temp + (size_t)ym1 * (size_t)width;
+        const uint8_t *restrict r2 = temp + (size_t)y   * (size_t)width;
+        const uint8_t *restrict r3 = temp + (size_t)yp1 * (size_t)width;
+        const uint8_t *restrict r4 = temp + (size_t)yp2 * (size_t)width;
+        uint8_t *restrict dst = output + (size_t)y * (size_t)width;
+
+        #pragma omp simd
+        for (int x = 0; x < width; x++)
+        {
+            int sum = r0[x] * 1
+                    + r1[x] * 4
+                    + r2[x] * 6
+                    + r3[x] * 4
+                    + r4[x] * 1;
+            dst[x] = (uint8_t)(sum >> 4);
+        }
+    }
 }
 
 float magnitude_and_angle(const uint8_t *input, float *output_magnitude, uint8_t *output_angle, int width, int height)
@@ -147,6 +237,17 @@ float magnitude_and_angle(const uint8_t *input, float *output_magnitude, uint8_t
 
     float max = 0.0f;
 
+    /*SLOWER WAY OF FINDING THE ANGLE USING TAN FUNCTION
+    float angle = atan2f(gy, gx) * (180.0f / (float)M_PI);
+    if (angle < 0.0f) angle += 180.0f;
+
+    if ((angle >= 0.0f && angle < 22.5f) || (angle >= 157.5f && angle <= 180.0f)) output_angle[idx] = 0;
+    else if (angle >= 22.5f && angle < 67.5f)  output_angle[idx] = 1;
+    else if (angle >= 67.5f && angle < 112.5f) output_angle[idx] = 2;
+    else                                       output_angle[idx] = 3;
+    */
+
+    /*SLOWER WAY, COLLAPSE(2) + CRITICAL SECTION, THE IF/ELSE CHAIN AND MISSING RESTRICT POINTERS STOP VECTORIZATION
     #pragma omp parallel
     {
         float local_max = 0.0f;
@@ -176,22 +277,45 @@ float magnitude_and_angle(const uint8_t *input, float *output_magnitude, uint8_t
                 else if (abs_gy >= 2.4142f * abs_gx) output_angle[idx] = 2;
                 else if (gx * gy > 0.0f) output_angle[idx] = 1;
                 else output_angle[idx] = 3;
-
-                /*SLOWER WAY OF FINDING THE ANGLE USING TAN FUNCTION
-                float angle = atan2f(gy, gx) * (180.0f / (float)M_PI);
-                if (angle < 0.0f) angle += 180.0f;
-
-                if ((angle >= 0.0f && angle < 22.5f) || (angle >= 157.5f && angle <= 180.0f)) output_angle[idx] = 0;
-                else if (angle >= 22.5f && angle < 67.5f)  output_angle[idx] = 1;
-                else if (angle >= 67.5f && angle < 112.5f) output_angle[idx] = 2;
-                else                                       output_angle[idx] = 3;
-                */
             }
         }
 
         #pragma omp critical
         {
             if (local_max > max) max = local_max;
+        }
+    }
+    */
+
+    //FASTER WAY, ONE ROW PER THREAD, INTEGER SOBEL SUMS, BRANCHLESS DIRECTION AND AN OPENMP MAX REDUCTION (SIMD)
+    #pragma omp parallel for reduction(max:max)
+    for (int y = 1; y < height - 1; y++)
+    {
+        const uint8_t *restrict up   = input + (size_t)(y - 1) * (size_t)width;
+        const uint8_t *restrict mid  = input + (size_t)y       * (size_t)width;
+        const uint8_t *restrict down = input + (size_t)(y + 1) * (size_t)width;
+        float   *restrict mag_row = output_magnitude + (size_t)y * (size_t)width;
+        uint8_t *restrict ang_row = output_angle     + (size_t)y * (size_t)width;
+
+        #pragma omp simd reduction(max:max)
+        for (int x = 1; x < width - 1; x++)
+        {
+            int gx = (up[x + 1] + 2 * mid[x + 1] + down[x + 1]) - (up[x - 1] + 2 * mid[x - 1] + down[x - 1]);
+            int gy = (down[x - 1] + 2 * down[x] + down[x + 1]) - (up[x - 1] + 2 * up[x] + up[x + 1]);
+
+            float fgx = (float)gx;
+            float fgy = (float)gy;
+            float mag = sqrtf(fgx * fgx + fgy * fgy);
+            mag_row[x] = mag;
+            max = mag > max ? mag : max;
+
+            //FASTER WAY OF FINDING TAN USING GY/GX
+            float abs_gx = fabsf(fgx);
+            float abs_gy = fabsf(fgy);
+            ang_row[x] = (uint8_t)(abs_gy <= 0.4142f * abs_gx ? 0
+                                 : abs_gy >= 2.4142f * abs_gx ? 2
+                                 : gx * gy > 0               ? 1
+                                 :                             3);
         }
     }
 
@@ -202,6 +326,7 @@ void non_maximum_suppression(const float *magnitude_arr, const uint8_t *angles, 
 {
     if (!magnitude_arr || !angles || !output) return;
 
+    /*SLOWER WAY, THE SWITCH STOPS VECTORIZATION AND THE NORMALIZATION NEEDS A SECOND PASS OVER THE WHOLE IMAGE
     #pragma omp parallel for collapse(2)
     for (int y = 1; y < height - 1; y++)
     {
@@ -247,6 +372,39 @@ void non_maximum_suppression(const float *magnitude_arr, const uint8_t *angles, 
             output[i] = (output[i] / max_mag) * 255.0f;
         }
     }
+    */
+
+    //FASTER WAY, EVERY DIRECTION IS TESTED AND THE RIGHT RESULT IS PICKED WITH BIT MASKS INSTEAD OF BRANCHES (SIMD), NORMALIZATION IS DONE IN THE SAME PASS
+    const float scale = max_mag > 0.0f ? 255.0f / max_mag : 0.0f;
+
+    #pragma omp parallel for
+    for (int y = 1; y < height - 1; y++)
+    {
+        const float   *restrict up   = magnitude_arr + (size_t)(y - 1) * (size_t)width;
+        const float   *restrict mid  = magnitude_arr + (size_t)y       * (size_t)width;
+        const float   *restrict down = magnitude_arr + (size_t)(y + 1) * (size_t)width;
+        const uint8_t *restrict dir_row = angles + (size_t)y * (size_t)width;
+        float *restrict out = output + (size_t)y * (size_t)width;
+
+        #pragma omp simd
+        for (int x = 1; x < width - 1; x++)
+        {
+            float mag = mid[x];
+            int dir = dir_row[x];
+
+            int keep_horizontal = (mag > mid[x - 1])  & (mag > mid[x + 1]);
+            int keep_diagonal   = (mag > up[x - 1])   & (mag > down[x + 1]);
+            int keep_vertical   = (mag > up[x])       & (mag > down[x]);
+            int keep_antidiag   = (mag > up[x + 1])   & (mag > down[x - 1]);
+
+            int keep = ((dir == 0) & keep_horizontal)
+                     | ((dir == 1) & keep_diagonal)
+                     | ((dir == 2) & keep_vertical)
+                     | ((dir == 3) & keep_antidiag);
+
+            out[x] = keep ? mag * scale : 0.0f;
+        }
+    }
 }
 
 void histeresis(const float *nms, uint8_t *output, int width, int height)
@@ -255,11 +413,18 @@ void histeresis(const float *nms, uint8_t *output, int width, int height)
 
     size_t total = (size_t)width * (size_t)height;
     static int *stack = NULL;
+    static int *row_count = NULL;
     if (!stack) {
         stack = malloc(total * sizeof(*stack));
-        if (!stack) return;
+        row_count = malloc((size_t)height * sizeof(*row_count));
+        if (!stack || !row_count) {
+            free(stack);     stack = NULL;
+            free(row_count); row_count = NULL;
+            return;
+        }
     }
 
+    /*SLOWER WAY, THE WHOLE IMAGE IS CLASSIFIED ON A SINGLE THREAD
     int top = 0;
     for (int y = 0; y < height; y++)
     {
@@ -274,6 +439,36 @@ void histeresis(const float *nms, uint8_t *output, int width, int height)
             else if (nms[idx] >= 8.0f) output[idx] = 128;
             else                       output[idx] = 0;
         }
+    }
+    */
+
+    //FASTER WAY, ROWS ARE CLASSIFIED IN PARALLEL AND EACH ROW SAVES ITS STRONG PIXELS IN ITS OWN SLICE OF THE STACK
+    #pragma omp parallel for
+    for (int y = 0; y < height; y++)
+    {
+        const float *restrict src = nms + (size_t)y * (size_t)width;
+        uint8_t *restrict dst = output + (size_t)y * (size_t)width;
+        int *restrict seeds = stack + (size_t)y * (size_t)width;
+        int count = 0;
+
+        for (int x = 0; x < width; x++)
+        {
+            float v = src[x];
+            if (v >= 20.0f)
+            {
+                dst[x] = 255;
+                seeds[count++] = y * width + x;
+            }
+            else dst[x] = v >= 8.0f ? 128 : 0;
+        }
+        row_count[y] = count;
+    }
+
+    int top = 0;
+    for (int y = 0; y < height; y++)
+    {
+        memmove(stack + top, stack + (size_t)y * (size_t)width, (size_t)row_count[y] * sizeof(*stack));
+        top += row_count[y];
     }
 
     while (top > 0)
@@ -300,9 +495,22 @@ void histeresis(const float *nms, uint8_t *output, int width, int height)
         }
     }
 
+    /*SLOWER WAY, THE CONDITIONAL STORE STOPS VECTORIZATION
     #pragma omp parallel for
     for (size_t i = 0; i < total; i++) {
         if (output[i] == 128) output[i] = 0;
     }
+    */
 
+    //FASTER WAY, ONE ROW PER THREAD AND AN UNCONDITIONAL STORE (SIMD)
+    #pragma omp parallel for
+    for (int y = 0; y < height; y++)
+    {
+        uint8_t *restrict row = output + (size_t)y * (size_t)width;
+
+        #pragma omp simd
+        for (int x = 0; x < width; x++) {
+            row[x] = row[x] == 255 ? 255 : 0;
+        }
+    }
 }

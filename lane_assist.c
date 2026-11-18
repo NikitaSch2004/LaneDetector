@@ -14,6 +14,7 @@ void roi_mask(uint8_t *input, int width, int height)
 
     float y_top = (float)height * 0.55f;
 
+    /*SLOWER WAY, EVERY PIXEL IS COMPARED AGAINST THE TWO BOUNDS
     #pragma omp parallel for
     for (int y = 0; y < height; y++)
     {
@@ -33,6 +34,33 @@ void roi_mask(uint8_t *input, int width, int height)
             }
         }
     }
+    */
+
+    //FASTER WAY, THE BOUNDS ARE TURNED INTO PIXEL INDICES ONCE PER ROW AND THE OUTSIDE PARTS ARE CLEARED WITH MEMSET
+    #pragma omp parallel for
+    for (int y = 0; y < height; y++)
+    {
+        uint8_t *row = input + (size_t)y * (size_t)width;
+
+        if ((float)y < y_top) {
+            memset(row, 0, (size_t)width);
+            continue;
+        }
+
+        float t = ((float)y - y_top) / ((float)height - y_top);
+        float left_bound  = (0.40f - 0.35f * t) * (float)width;
+        float right_bound = (0.60f + 0.35f * t) * (float)width;
+
+        int left_end    = (int)floorf(left_bound) + 1;
+        int right_start = (int)ceilf(right_bound);
+        if (left_end < 0) left_end = 0;
+        if (left_end > width) left_end = width;
+        if (right_start < 0) right_start = 0;
+        if (right_start > width) right_start = width;
+
+        memset(row, 0, (size_t)left_end);
+        memset(row + right_start, 0, (size_t)(width - right_start));
+    }
 }
 
 void hough_transform(const uint8_t *input, unsigned char *draw, int width, int height)
@@ -47,14 +75,21 @@ void hough_transform(const uint8_t *input, unsigned char *draw, int width, int h
     const int num_rho = 2 * max_dist + 1;
     size_t accum_size = (size_t)num_rho * 180;
     static int *accum = NULL;
+    static float *edge_x = NULL;
+    static float *edge_y = NULL;
     static float cos_table[180];
     static float sin_table[180];
     static int tables_initialized = 0;
 
     if (!accum) {
-        accum = malloc(accum_size * sizeof(*accum));
-        if (!accum) {
+        accum  = calloc(accum_size, sizeof(*accum));
+        edge_x = malloc((size_t)width * (size_t)height * sizeof(*edge_x));
+        edge_y = malloc((size_t)width * (size_t)height * sizeof(*edge_y));
+        if (!accum || !edge_x || !edge_y) {
             printf("Memory allocation failed in hough_transform!\n");
+            free(accum);  accum = NULL;
+            free(edge_x); edge_x = NULL;
+            free(edge_y); edge_y = NULL;
             return;
         }
     }
@@ -68,14 +103,9 @@ void hough_transform(const uint8_t *input, unsigned char *draw, int width, int h
         tables_initialized = 1;
     }
 
-    for (int theta = 0; theta < 180; theta++) {
-        float rad = (float)theta * ((float)M_PI / 180.0f);
-        cos_table[theta] = cosf(rad);
-        sin_table[theta] = sinf(rad);
-    }
-
     int y_start = (int)((float)height * 0.55f);
 
+    /*SLOWER WAY, EVERY VOTE IS AN ATOMIC INCREMENT AND ALL THREADS FIGHT OVER THE SAME ACCUMULATOR CELLS
     #pragma omp parallel for collapse(2)
     for (int y = y_start; y < height; y++)
     {
@@ -118,6 +148,68 @@ void hough_transform(const uint8_t *input, unsigned char *draw, int width, int h
             }
         }
     }
+    */
+
+    //FASTER WAY, EDGE PIXELS ARE COLLECTED ONCE AND EVERY THREAD OWNS WHOLE THETA ROWS OF THE ACCUMULATOR, SO NO ATOMICS ARE NEEDED
+    int num_edges = 0;
+    for (int y = y_start; y < height; y++)
+    {
+        const uint8_t *row = input + (size_t)y * (size_t)width;
+        for (int x = 0; x < width; x++)
+        {
+            if (row[x] == 255)
+            {
+                edge_x[num_edges] = (float)x;
+                edge_y[num_edges] = (float)y;
+                num_edges++;
+            }
+        }
+    }
+
+    #pragma omp parallel for schedule(dynamic)
+    for (int theta = 5; theta <= 175; theta++)
+    {
+        if (theta > 75 && theta < 105) continue;
+
+        int *restrict votes_row = accum + (size_t)theta * (size_t)num_rho + (size_t)max_dist;
+        const float c = cos_table[theta];
+        const float s = sin_table[theta];
+
+        for (int i = 0; i < num_edges; i++)
+        {
+            int rho = (int)roundf(edge_x[i] * c + edge_y[i] * s);
+            votes_row[rho]++;
+        }
+    }
+
+    float best_left_theta = 0.0f, best_left_dist = 0.0f;
+    float best_right_theta = 0.0f, best_right_dist = 0.0f;
+    int max_left_votes = 0, max_right_votes = 0;
+    int best_left_rho = 0, best_right_rho = 0;
+
+    for (int theta = 5; theta <= 175; theta++)
+    {
+        if (theta > 75 && theta < 105) continue;
+
+        const int *votes_row = accum + (size_t)theta * (size_t)num_rho;
+        int is_left = theta <= 75;
+        int *max_votes = is_left ? &max_left_votes : &max_right_votes;
+        int *best_rho  = is_left ? &best_left_rho  : &best_right_rho;
+
+        for (int rho_idx = 0; rho_idx < num_rho; rho_idx++)
+        {
+            int votes = votes_row[rho_idx];
+            if (votes > *max_votes || (votes == *max_votes && votes > 0 && rho_idx < *best_rho))
+            {
+                *max_votes = votes;
+                *best_rho  = rho_idx;
+                if (is_left) best_left_theta  = (float)theta;
+                else         best_right_theta = (float)theta;
+            }
+        }
+    }
+    best_left_dist  = (float)(best_left_rho  - max_dist);
+    best_right_dist = (float)(best_right_rho - max_dist);
 
     if (max_left_votes > 20) {
         if (!has_left) {

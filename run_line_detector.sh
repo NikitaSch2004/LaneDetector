@@ -4,23 +4,21 @@ set -e
 
 cd "$(dirname "$0")"
 
-echo "=========================================="
-echo " Compiling C pipeline (OpenMP + SIMD)"
-echo "=========================================="
-LIBOMP_PREFIX=$(brew --prefix libomp)
+INPUT_VIDEO="${1:-road.mp4}"
+OUTPUT_VIDEO="${2:-processed_road.mp4}"
 
-clang -O3 -march=native -ffast-math -Xpreprocessor -fopenmp \
-  -I"$LIBOMP_PREFIX/include" \
-  -L"$LIBOMP_PREFIX/lib" -lomp \
-  main.c canny.c lane_assist.c \
-  -o lane_detector
+./build.sh
 
 echo "=========================================="
 echo " Running Lane Detection Pipeline"
 echo "=========================================="
-time ./lane_detector
+time ./lane_detector "$INPUT_VIDEO" "$OUTPUT_VIDEO"
 
 echo "=========================================="
 echo " Done! Opening $OUTPUT_VIDEO..."
 echo "=========================================="
-open "$OUTPUT_VIDEO"
+if [[ "$(uname)" == "Darwin" ]]; then
+  open "$OUTPUT_VIDEO"
+elif command -v xdg-open > /dev/null; then
+  xdg-open "$OUTPUT_VIDEO"
+fi
