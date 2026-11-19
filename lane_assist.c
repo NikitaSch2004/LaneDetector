@@ -8,6 +8,11 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+int roi_first_row(int height)
+{
+    return (int)ceilf((float)height * 0.55f);
+}
+
 void roi_mask(uint8_t *input, int width, int height)
 {
     if (!input) return;
@@ -77,6 +82,9 @@ void hough_transform(const uint8_t *input, unsigned char *draw, int width, int h
     static int *accum = NULL;
     static float *edge_x = NULL;
     static float *edge_y = NULL;
+    static int *row_edges = NULL;
+    static int theta_peak_votes[180];
+    static int theta_peak_rho[180];
     static float cos_table[180];
     static float sin_table[180];
     static int tables_initialized = 0;
@@ -85,11 +93,13 @@ void hough_transform(const uint8_t *input, unsigned char *draw, int width, int h
         accum  = calloc(accum_size, sizeof(*accum));
         edge_x = malloc((size_t)width * (size_t)height * sizeof(*edge_x));
         edge_y = malloc((size_t)width * (size_t)height * sizeof(*edge_y));
-        if (!accum || !edge_x || !edge_y) {
+        row_edges = malloc((size_t)height * sizeof(*row_edges));
+        if (!accum || !edge_x || !edge_y || !row_edges) {
             printf("Memory allocation failed in hough_transform!\n");
-            free(accum);  accum = NULL;
-            free(edge_x); edge_x = NULL;
-            free(edge_y); edge_y = NULL;
+            free(accum);     accum = NULL;
+            free(edge_x);    edge_x = NULL;
+            free(edge_y);    edge_y = NULL;
+            free(row_edges); row_edges = NULL;
             return;
         }
     }
@@ -150,7 +160,7 @@ void hough_transform(const uint8_t *input, unsigned char *draw, int width, int h
     }
     */
 
-    //FASTER WAY, EDGE PIXELS ARE COLLECTED ONCE AND EVERY THREAD OWNS WHOLE THETA ROWS OF THE ACCUMULATOR, SO NO ATOMICS ARE NEEDED
+    /*SLOWER WAY, ONE THREAD COLLECTS THE EDGE PIXELS AND SEARCHES THE PEAKS, AND THE WHOLE ACCUMULATOR IS CLEARED ON ONE THREAD AT THE END
     int num_edges = 0;
     for (int y = y_start; y < height; y++)
     {
@@ -206,6 +216,106 @@ void hough_transform(const uint8_t *input, unsigned char *draw, int width, int h
                 if (is_left) best_left_theta  = (float)theta;
                 else         best_right_theta = (float)theta;
             }
+        }
+    }
+    best_left_dist  = (float)(best_left_rho  - max_dist);
+    best_right_dist = (float)(best_right_rho - max_dist);
+    */
+
+    //FASTER WAY, ROWS COLLECT THEIR EDGE PIXELS IN PARALLEL, THEN EVERY THREAD COMPUTES RHO FOR 256 PIXELS AT A TIME (SIMD), VOTES, FINDS THE PEAK AND CLEARS ITS OWN THETA ROWS WHILE THEY ARE STILL IN CACHE
+    #pragma omp parallel for schedule(dynamic, 8)
+    for (int y = y_start; y < height; y++)
+    {
+        const uint8_t *restrict row = input + (size_t)y * (size_t)width;
+        float *restrict xs = edge_x + (size_t)(y - y_start) * (size_t)width;
+        float *restrict ys = edge_y + (size_t)(y - y_start) * (size_t)width;
+        int count = 0;
+
+        for (int x = 0; x < width; x++)
+        {
+            if (row[x] == 255)
+            {
+                xs[count] = (float)x;
+                ys[count] = (float)y;
+                count++;
+            }
+        }
+        row_edges[y] = count;
+    }
+
+    int num_edges = 0;
+    for (int y = y_start; y < height; y++)
+    {
+        size_t slice = (size_t)(y - y_start) * (size_t)width;
+        memmove(edge_x + num_edges, edge_x + slice, (size_t)row_edges[y] * sizeof(*edge_x));
+        memmove(edge_y + num_edges, edge_y + slice, (size_t)row_edges[y] * sizeof(*edge_y));
+        num_edges += row_edges[y];
+    }
+
+    #pragma omp parallel for schedule(dynamic)
+    for (int theta = 5; theta <= 175; theta++)
+    {
+        if (theta > 75 && theta < 105) continue;
+
+        int *restrict votes_row = accum + (size_t)theta * (size_t)num_rho;
+        const float c = cos_table[theta];
+        const float s = sin_table[theta];
+
+        for (int first = 0; first < num_edges; first += 256)
+        {
+            int count = num_edges - first < 256 ? num_edges - first : 256;
+            int rho_idx[256];
+
+            #pragma omp simd
+            for (int k = 0; k < count; k++)
+            {
+                rho_idx[k] = (int)roundf(edge_x[first + k] * c + edge_y[first + k] * s) + max_dist;
+            }
+            for (int k = 0; k < count; k++)
+            {
+                votes_row[rho_idx[k]]++;
+            }
+        }
+
+        int peak = 0;
+        #pragma omp simd reduction(max:peak)
+        for (int rho_idx = 0; rho_idx < num_rho; rho_idx++)
+        {
+            peak = votes_row[rho_idx] > peak ? votes_row[rho_idx] : peak;
+        }
+
+        int peak_rho = 0;
+        if (peak > 0)
+        {
+            while (votes_row[peak_rho] != peak) peak_rho++;
+        }
+
+        theta_peak_votes[theta] = peak;
+        theta_peak_rho[theta]   = peak_rho;
+        memset(votes_row, 0, (size_t)num_rho * sizeof(*votes_row));
+    }
+
+    float best_left_theta = 0.0f, best_left_dist = 0.0f;
+    float best_right_theta = 0.0f, best_right_dist = 0.0f;
+    int max_left_votes = 0, max_right_votes = 0;
+    int best_left_rho = 0, best_right_rho = 0;
+
+    for (int theta = 5; theta <= 175; theta++)
+    {
+        if (theta > 75 && theta < 105) continue;
+
+        int votes   = theta_peak_votes[theta];
+        int rho_idx = theta_peak_rho[theta];
+        int is_left = theta <= 75;
+        int *max_votes = is_left ? &max_left_votes : &max_right_votes;
+        int *best_rho  = is_left ? &best_left_rho  : &best_right_rho;
+
+        if (votes > *max_votes || (votes == *max_votes && votes > 0 && rho_idx < *best_rho))
+        {
+            *max_votes = votes;
+            *best_rho  = rho_idx;
+            if (is_left) best_left_theta  = (float)theta;
+            else         best_right_theta = (float)theta;
         }
     }
     best_left_dist  = (float)(best_left_rho  - max_dist);
@@ -288,5 +398,7 @@ void hough_transform(const uint8_t *input, unsigned char *draw, int width, int h
         }
     }
 
+    /*SLOWER WAY, THE WHOLE ACCUMULATOR WAS CLEARED ON ONE THREAD AFTER DRAWING
     memset(accum, 0, accum_size * sizeof(*accum));
+    */
 }

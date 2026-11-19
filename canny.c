@@ -8,6 +8,13 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+static inline uint8_t gray_pixel(int r, int g, int b)
+{
+    int gray = (306 * r + 601 * g + 117 * b) >> 10;
+    int yellow = r > 140 && g > 120 && b < 100 && (r - b) > 50;
+    return (uint8_t)(yellow ? 255 : gray);
+}
+
 void rgbToGrayscale(const uint8_t *img, uint8_t *output, const int width, const int height, const int channels)
 {
     if (!img || !output) return;
@@ -34,7 +41,7 @@ void rgbToGrayscale(const uint8_t *img, uint8_t *output, const int width, const 
     }
     */
 
-    //FASTER WAY, ONE ROW PER THREAD WITH RESTRICT POINTERS SO THE INNER LOOP IS VECTORIZED (SIMD)
+    /*SLOWER WAY, THE STRIDE IS ONLY KNOWN AT RUNTIME SO THE COMPILER LOADS EVERY BYTE ON ITS OWN
     #pragma omp parallel for
     for (int y = 0; y < height; y++) {
         const uint8_t *restrict src = img + (size_t)y * (size_t)width * (size_t)channels;
@@ -52,9 +59,36 @@ void rgbToGrayscale(const uint8_t *img, uint8_t *output, const int width, const 
             dst[x] = (uint8_t)(yellow ? 255 : gray);
         }
     }
+    */
+
+    //FASTER WAY, A CONSTANT STRIDE OF 3 LETS THE COMPILER USE NEON LD3, WHICH LOADS AND SPLITS 16 RGB PIXELS IN ONE INSTRUCTION
+    if (channels == 3) {
+        #pragma omp parallel for schedule(dynamic, 8)
+        for (int y = 0; y < height; y++) {
+            const uint8_t *restrict src = img + (size_t)y * (size_t)width * 3;
+            uint8_t *restrict dst = output + (size_t)y * (size_t)width;
+
+            #pragma omp simd
+            for (int x = 0; x < width; x++) {
+                dst[x] = gray_pixel(src[3 * x], src[3 * x + 1], src[3 * x + 2]);
+            }
+        }
+        return;
+    }
+
+    #pragma omp parallel for schedule(dynamic, 8)
+    for (int y = 0; y < height; y++) {
+        const uint8_t *restrict src = img + (size_t)y * (size_t)width * (size_t)channels;
+        uint8_t *restrict dst = output + (size_t)y * (size_t)width;
+
+        #pragma omp simd
+        for (int x = 0; x < width; x++) {
+            dst[x] = gray_pixel(src[x * channels], src[x * channels + 1], src[x * channels + 2]);
+        }
+    }
 }
 
-void cannyEdge(const uint8_t *img, uint8_t *output, int width, int height)
+void cannyEdge(const uint8_t *img, uint8_t *output, int width, int height, int first_row)
 {
     if (!img || !output) return;
 
@@ -89,8 +123,8 @@ void cannyEdge(const uint8_t *img, uint8_t *output, int width, int height)
 
     gaussian_blur_conv(img, gaussian_blur, width, height);
     float max_mag = magnitude_and_angle(gaussian_blur, magnitude_arr, angles, width, height);
-    non_maximum_suppression(magnitude_arr, angles, nms, width, height, max_mag);
-    histeresis(nms, output, width, height);
+    non_maximum_suppression(magnitude_arr, angles, nms, width, height, max_mag, first_row);
+    histeresis(nms, output, width, height, first_row);
 }
 
 void gaussian_blur_conv(const uint8_t *img, uint8_t *output, const int width, const int height)
@@ -173,7 +207,7 @@ void gaussian_blur_conv(const uint8_t *img, uint8_t *output, const int width, co
         if (!temp) return;
     }
 
-    #pragma omp parallel for
+    #pragma omp parallel for schedule(dynamic, 8)
     for (int y = 0; y < height; y++)
     {
         const uint8_t *restrict src = img + (size_t)y * (size_t)width;
@@ -203,7 +237,7 @@ void gaussian_blur_conv(const uint8_t *img, uint8_t *output, const int width, co
         }
     }
 
-    #pragma omp parallel for
+    #pragma omp parallel for schedule(dynamic, 8)
     for (int y = 0; y < height; y++)
     {
         int ym2 = y - 2 < 0 ? 0 : y - 2;
@@ -288,7 +322,7 @@ float magnitude_and_angle(const uint8_t *input, float *output_magnitude, uint8_t
     */
 
     //FASTER WAY, ONE ROW PER THREAD, INTEGER SOBEL SUMS, BRANCHLESS DIRECTION AND AN OPENMP MAX REDUCTION (SIMD)
-    #pragma omp parallel for reduction(max:max)
+    #pragma omp parallel for reduction(max:max) schedule(dynamic, 8)
     for (int y = 1; y < height - 1; y++)
     {
         const uint8_t *restrict up   = input + (size_t)(y - 1) * (size_t)width;
@@ -322,7 +356,7 @@ float magnitude_and_angle(const uint8_t *input, float *output_magnitude, uint8_t
     return max;
 }
 
-void non_maximum_suppression(const float *magnitude_arr, const uint8_t *angles, float *output, int width, int height, float max_mag)
+void non_maximum_suppression(const float *magnitude_arr, const uint8_t *angles, float *output, int width, int height, float max_mag, int first_row)
 {
     if (!magnitude_arr || !angles || !output) return;
 
@@ -377,8 +411,8 @@ void non_maximum_suppression(const float *magnitude_arr, const uint8_t *angles, 
     //FASTER WAY, EVERY DIRECTION IS TESTED AND THE RIGHT RESULT IS PICKED WITH BIT MASKS INSTEAD OF BRANCHES (SIMD), NORMALIZATION IS DONE IN THE SAME PASS
     const float scale = max_mag > 0.0f ? 255.0f / max_mag : 0.0f;
 
-    #pragma omp parallel for
-    for (int y = 1; y < height - 1; y++)
+    #pragma omp parallel for schedule(dynamic, 8)
+    for (int y = first_row > 1 ? first_row : 1; y < height - 1; y++)
     {
         const float   *restrict up   = magnitude_arr + (size_t)(y - 1) * (size_t)width;
         const float   *restrict mid  = magnitude_arr + (size_t)y       * (size_t)width;
@@ -407,7 +441,7 @@ void non_maximum_suppression(const float *magnitude_arr, const uint8_t *angles, 
     }
 }
 
-void histeresis(const float *nms, uint8_t *output, int width, int height)
+void histeresis(const float *nms, uint8_t *output, int width, int height, int first_row)
 {
     if (!nms || !output) return;
 
@@ -423,6 +457,9 @@ void histeresis(const float *nms, uint8_t *output, int width, int height)
             return;
         }
     }
+
+    if (first_row < 0) first_row = 0;
+    if (first_row > height) first_row = height;
 
     /*SLOWER WAY, THE WHOLE IMAGE IS CLASSIFIED ON A SINGLE THREAD
     int top = 0;
@@ -442,7 +479,7 @@ void histeresis(const float *nms, uint8_t *output, int width, int height)
     }
     */
 
-    //FASTER WAY, ROWS ARE CLASSIFIED IN PARALLEL AND EACH ROW SAVES ITS STRONG PIXELS IN ITS OWN SLICE OF THE STACK
+    /*SLOWER WAY, THE WHOLE IMAGE IS CLASSIFIED AND EVERY STRONG PIXEL BECOMES A SEED, EVEN THE ONES WITH NO WEAK NEIGHBOUR TO GROW INTO
     #pragma omp parallel for
     for (int y = 0; y < height; y++)
     {
@@ -466,6 +503,54 @@ void histeresis(const float *nms, uint8_t *output, int width, int height)
 
     int top = 0;
     for (int y = 0; y < height; y++)
+    {
+        memmove(stack + top, stack + (size_t)y * (size_t)width, (size_t)row_count[y] * sizeof(*stack));
+        top += row_count[y];
+    }
+    */
+
+    //FASTER WAY, ONLY THE ROWS FROM FIRST_ROW DOWN ARE CLASSIFIED (SIMD) AND ONLY STRONG PIXELS THAT TOUCH A WEAK PIXEL BECOME SEEDS
+    memset(output, 0, (size_t)first_row * (size_t)width);
+
+    #pragma omp parallel for schedule(dynamic, 8)
+    for (int y = first_row; y < height; y++)
+    {
+        const float *restrict src = nms + (size_t)y * (size_t)width;
+        uint8_t *restrict dst = output + (size_t)y * (size_t)width;
+
+        #pragma omp simd
+        for (int x = 0; x < width; x++)
+        {
+            float v = src[x];
+            dst[x] = (uint8_t)(v >= 20.0f ? 255 : (v >= 8.0f ? 128 : 0));
+        }
+    }
+
+    int seed_first = first_row > 1 ? first_row : 1;
+
+    #pragma omp parallel for schedule(dynamic, 8)
+    for (int y = seed_first; y < height - 1; y++)
+    {
+        const uint8_t *up   = output + (size_t)(y - 1) * (size_t)width;
+        const uint8_t *mid  = output + (size_t)y       * (size_t)width;
+        const uint8_t *down = output + (size_t)(y + 1) * (size_t)width;
+        int *restrict seeds = stack + (size_t)y * (size_t)width;
+        int count = 0;
+
+        for (int x = 1; x < width - 1; x++)
+        {
+            if (mid[x] != 255) continue;
+
+            int touches_weak = (up[x - 1]   == 128) | (up[x]   == 128) | (up[x + 1]   == 128)
+                             | (mid[x - 1]  == 128)                     | (mid[x + 1]  == 128)
+                             | (down[x - 1] == 128) | (down[x] == 128) | (down[x + 1] == 128);
+            if (touches_weak) seeds[count++] = y * width + x;
+        }
+        row_count[y] = count;
+    }
+
+    int top = 0;
+    for (int y = seed_first; y < height - 1; y++)
     {
         memmove(stack + top, stack + (size_t)y * (size_t)width, (size_t)row_count[y] * sizeof(*stack));
         top += row_count[y];
@@ -503,8 +588,8 @@ void histeresis(const float *nms, uint8_t *output, int width, int height)
     */
 
     //FASTER WAY, ONE ROW PER THREAD AND AN UNCONDITIONAL STORE (SIMD)
-    #pragma omp parallel for
-    for (int y = 0; y < height; y++)
+    #pragma omp parallel for schedule(dynamic, 8)
+    for (int y = first_row; y < height; y++)
     {
         uint8_t *restrict row = output + (size_t)y * (size_t)width;
 

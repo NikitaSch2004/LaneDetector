@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <pthread.h>
 #include <omp.h>
 #include "canny.h"
 #include "lane_assist.h"
@@ -26,6 +27,80 @@
 #endif
 
 #define PROCESSING_WIDTH 1280
+#define RING_SIZE 4
+#define CANNY_ROW_MARGIN 32
+
+enum { SLOT_FREE, SLOT_READ, SLOT_PROCESSED, SLOT_END };
+
+typedef struct {
+    FILE *pipe_in;
+    FILE *pipe_out;
+    size_t frame_bytes;
+    uint8_t *frames[RING_SIZE];
+    int state[RING_SIZE];
+    int stop;
+    int write_failed;
+    pthread_mutex_t lock;
+    pthread_cond_t changed;
+} FrameRing;
+
+static int ring_wait(FrameRing *ring, int slot, int wanted, int alternative)
+{
+    pthread_mutex_lock(&ring->lock);
+    while (ring->state[slot] != wanted && ring->state[slot] != alternative && !ring->stop) {
+        pthread_cond_wait(&ring->changed, &ring->lock);
+    }
+    int state = ring->stop ? SLOT_END : ring->state[slot];
+    pthread_mutex_unlock(&ring->lock);
+    return state;
+}
+
+static void ring_set(FrameRing *ring, int slot, int state)
+{
+    pthread_mutex_lock(&ring->lock);
+    ring->state[slot] = state;
+    pthread_cond_broadcast(&ring->changed);
+    pthread_mutex_unlock(&ring->lock);
+}
+
+static void ring_stop(FrameRing *ring)
+{
+    pthread_mutex_lock(&ring->lock);
+    ring->stop = 1;
+    pthread_cond_broadcast(&ring->changed);
+    pthread_mutex_unlock(&ring->lock);
+}
+
+static void *reader_thread(void *arg)
+{
+    FrameRing *ring = arg;
+    for (long i = 0; ; i++) {
+        int slot = (int)(i % RING_SIZE);
+        if (ring_wait(ring, slot, SLOT_FREE, SLOT_FREE) != SLOT_FREE) return NULL;
+
+        if (fread(ring->frames[slot], 1, ring->frame_bytes, ring->pipe_in) != ring->frame_bytes) {
+            ring_set(ring, slot, SLOT_END);
+            return NULL;
+        }
+        ring_set(ring, slot, SLOT_READ);
+    }
+}
+
+static void *writer_thread(void *arg)
+{
+    FrameRing *ring = arg;
+    for (long i = 0; ; i++) {
+        int slot = (int)(i % RING_SIZE);
+        if (ring_wait(ring, slot, SLOT_PROCESSED, SLOT_END) != SLOT_PROCESSED) return NULL;
+
+        if (fwrite(ring->frames[slot], 1, ring->frame_bytes, ring->pipe_out) != ring->frame_bytes) {
+            ring->write_failed = 1;
+            ring_stop(ring);
+            return NULL;
+        }
+        ring_set(ring, slot, SLOT_FREE);
+    }
+}
 
 int main(int argc, char **argv) {
     /*READS ONE JPG AT A TIME PROCCESSES AND WRITES IT AGAIN ON DISK, VERY SLOW
@@ -126,6 +201,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /*SLOWER WAY, READING, PROCESSING AND WRITING HAPPEN ONE AFTER ANOTHER, SO THE VISION CODE WAITS FOR FFMPEG AND FFMPEG WAITS FOR IT
     uint8_t *frame_rgb  = malloc(frame_bytes);
     uint8_t *img_gray   = malloc((size_t)width * (size_t)height);
     uint8_t *output_img = malloc((size_t)width * (size_t)height);
@@ -164,12 +240,77 @@ int main(int argc, char **argv) {
     free(frame_rgb);
     free(img_gray);
     free(output_img);
+    */
 
+    //FASTER WAY, A READER THREAD AND A WRITER THREAD SHARE A RING OF FRAMES WITH THE VISION CODE, SO DECODING, PROCESSING AND ENCODING OVERLAP
+    const int first_row = roi_first_row(height) - CANNY_ROW_MARGIN;
+    int failed = 1;
+    int frame_count = 0;
+    double vision_seconds = 0.0;
+
+    FrameRing ring = { .pipe_in = pipe_in, .pipe_out = pipe_out, .frame_bytes = frame_bytes };
+    pthread_mutex_init(&ring.lock, NULL);
+    pthread_cond_init(&ring.changed, NULL);
+
+    uint8_t *img_gray   = malloc((size_t)width * (size_t)height);
+    uint8_t *output_img = malloc((size_t)width * (size_t)height);
+    int alloc_failed = !img_gray || !output_img;
+    for (int i = 0; i < RING_SIZE; i++) {
+        ring.frames[i] = malloc(frame_bytes);
+        if (!ring.frames[i]) alloc_failed = 1;
+    }
+
+    pthread_t reader, writer;
+    if (alloc_failed) {
+        fprintf(stderr, "Memory allocation failed in main!\n");
+        goto cleanup;
+    }
+    if (pthread_create(&reader, NULL, reader_thread, &ring) != 0) {
+        fprintf(stderr, "Failed to start the reader thread!\n");
+        goto cleanup;
+    }
+    if (pthread_create(&writer, NULL, writer_thread, &ring) != 0) {
+        fprintf(stderr, "Failed to start the writer thread!\n");
+        ring_stop(&ring);
+        pthread_join(reader, NULL);
+        goto cleanup;
+    }
+
+    for (long i = 0; ; i++) {
+        int slot = (int)(i % RING_SIZE);
+        if (ring_wait(&ring, slot, SLOT_READ, SLOT_END) != SLOT_READ) break;
+
+        uint8_t *frame_rgb = ring.frames[slot];
+        double start = omp_get_wtime();
+        rgbToGrayscale(frame_rgb, img_gray, width, height, 3);
+        cannyEdge(img_gray, output_img, width, height, first_row);
+        roi_mask(output_img, width, height);
+        hough_transform(output_img, frame_rgb, width, height);
+        vision_seconds += omp_get_wtime() - start;
+
+        ring_set(&ring, slot, SLOT_PROCESSED);
+        frame_count++;
+    }
+
+    pthread_join(reader, NULL);
+    pthread_join(writer, NULL);
+    failed = 0;
+
+cleanup:
+    pclose(pipe_in);
+    int encoder_status = pclose(pipe_out);
+    free(img_gray);
+    free(output_img);
+    for (int i = 0; i < RING_SIZE; i++) free(ring.frames[i]);
+    pthread_mutex_destroy(&ring.lock);
+    pthread_cond_destroy(&ring.changed);
+
+    if (failed) return 1;
     if (frame_count == 0) {
         fprintf(stderr, "No frames were read from %s!\n", input_path);
         return 1;
     }
-    if (write_failed || encoder_status != 0) {
+    if (ring.write_failed || encoder_status != 0) {
         fprintf(stderr, "FFmpeg failed while encoding %s!\n", output_path);
         return 1;
     }
